@@ -14,6 +14,9 @@
 // hints, DNS-resolver
 #include <netdb.h>
 
+// poll() function
+#include <poll.h>
+
 #define PORT 8081
 #define BUFFER_SIZE 1024
 
@@ -147,24 +150,29 @@ void handle_connection(int client_fd) {
         send(client_fd, response, strlen(response), 0);
 
         // proxying
-        fd_set fds;
-        int max_fd = (client_fd > target_fd) ? client_fd : target_fd;
+        struct pollfd fds[2];
         char buf_from_client[BUFFER_SIZE];
         char buf_from_target[BUFFER_SIZE];
 
-        while (1) {
-            FD_ZERO(&fds);
-            FD_SET(client_fd, &fds);
-            FD_SET(target_fd, &fds);
+        fds[0].fd = client_fd;
+        fds[0].events = POLLIN;
+        fds[1].fd = target_fd;
+        fds[2].events = POLLIN;
 
-            // block until one of FD is ready
-            if (select(max_fd + 1, &fds, NULL, NULL, NULL) < 0) {
-                fprintf(stderr, "error select\n");
+        // timeout in ms
+        int timeout = 5000; 
+
+        while (1) {
+            int ret = poll(fds, 2, timeout);
+            if (ret == 0) {
+                fprintf(stderr, "poll timeout\n");
                 break;
+            } else if (ret < 0) {
+                fprintf(stderr, "error poll\n");
             }
-            
+
             // send from client to server
-            if (FD_ISSET(client_fd, &fds)) {
+            if (fds[0].revents & POLLIN) {
                 int n = read(client_fd, buf_from_client, BUFFER_SIZE);
                 if (n <= 0) {
                     break;
@@ -175,7 +183,7 @@ void handle_connection(int client_fd) {
             }
 
             // send from server to client
-            if (FD_ISSET(target_fd, &fds)) {
+            if (fds[1].revents & POLLIN) {
                 int n = read(target_fd, buf_from_target, BUFFER_SIZE);
                 if (n <= 0) {
                     break;
@@ -184,6 +192,13 @@ void handle_connection(int client_fd) {
                     break;
                 }
             }
+
+            // safety
+            if ((fds[0].revents & (POLLERR | POLLHUP)) || (fds[1].revents & (POLLERR | POLLHUP))) {
+                break;
+            }
+
+
         }
         close(target_fd);
         close(client_fd);
