@@ -11,6 +11,9 @@
 // atoi() function
 #include <stdlib.h>
 
+// hints, DNS-resolver
+#include <netdb.h>
+
 #define PORT 8081
 #define BUFFER_SIZE 1024
 
@@ -38,7 +41,6 @@ int main() {
         return -1;
     }
 
-
     if (listen(server_fd, 5) == -1) {
         fprintf(stderr, "listen failed\n");
         close(server_fd);
@@ -47,7 +49,7 @@ int main() {
 
     printf("listening on port %d\n", PORT);
 
-    // now process client connections
+    // now handle client connections
     while (1) {
         int client_fd = accept(server_fd, NULL, NULL);
     
@@ -58,7 +60,6 @@ int main() {
 
         // handle connection
         handle_connection(client_fd);
-        // printf("client disconnected\n");
     }
 
     close(server_fd);
@@ -98,8 +99,6 @@ void handle_connection(int client_fd) {
         strncpy(port, colon + 1, port_len - 1);
         port[port_len] = '\0';
 
-        // printf("%s:%s - end\n", host, port);
-        
         // create connect to host:port
         int target_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (target_fd == -1) {
@@ -116,26 +115,78 @@ void handle_connection(int client_fd) {
             .sin_port = htons(port_i)
         };
 
-        // TODO: domain name resolve
+        // resolve domain name
+        struct addrinfo hints = {0};
+        struct addrinfo *res = NULL;
 
-        // finally, do CONNECT
-        if (connect(target_fd, (struct sockaddr*)&address, sizeof(address)) != 0) {
-            printf("connection with the target server failed\n");
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = 0;
+
+        if (getaddrinfo(host, port, &hints, &res) != 0) {
+            // send error to client_fd
+            close(target_fd);
             close(client_fd);
             return;
         }
 
-        char buf[1024];
-        int len = read(target_fd, buf, 1024);
-        
-        // TODO: proxying
-        // incorrect...
-        send(client_fd, buf, strlen(buf), 0);
-        send(target_fd, buffer, strlen(buffer), 0);
+        struct sockaddr_in *addr = (struct sockaddr_in*)res->ai_addr;
+        address.sin_addr = addr->sin_addr;
+        freeaddrinfo(res);
 
+        // finally, do CONNECT
+        if (connect(target_fd, (struct sockaddr*)&address, sizeof(address)) != 0) {
+            printf("connection with the target server failed\n");
+            close(target_fd);
+            close(client_fd);
+            return;
+        }
+
+        // connected
+        char *response = "HTTP/1.1 200 OK\n\n";
+        send(client_fd, response, strlen(response), 0);
+
+        // proxying
+        fd_set fds;
+        int max_fd = (client_fd > target_fd) ? client_fd : target_fd;
+        char buf_from_client[BUFFER_SIZE];
+        char buf_from_target[BUFFER_SIZE];
+
+        while (1) {
+            FD_ZERO(&fds);
+            FD_SET(client_fd, &fds);
+            FD_SET(target_fd, &fds);
+
+            // block until one of FD is ready
+            if (select(max_fd + 1, &fds, NULL, NULL, NULL) < 0) {
+                fprintf(stderr, "error select\n");
+                break;
+            }
+            
+            // send from client to server
+            if (FD_ISSET(client_fd, &fds)) {
+                int n = read(client_fd, buf_from_client, BUFFER_SIZE);
+                if (n <= 0) {
+                    break;
+                }
+                if (send(target_fd, buf_from_client, n, 0) < 0) {
+                    break;
+                }
+            }
+
+            // send from server to client
+            if (FD_ISSET(target_fd, &fds)) {
+                int n = read(target_fd, buf_from_target, BUFFER_SIZE);
+                if (n <= 0) {
+                    break;
+                }
+                if (send(client_fd, buf_from_target, n, 0) < 0) {
+                    break;
+                }
+            }
+        }
         close(target_fd);
+        close(client_fd);
     }
-
-    close(client_fd);
 }
 
