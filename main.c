@@ -17,10 +17,147 @@
 // poll() function
 #include <poll.h>
 
+// threads
+#include <pthread.h>
+
 #define PORT 8081
 #define BUFFER_SIZE 1024
 
+
+typedef struct task {
+    void (*function)(void*);    // pointer to func
+    void* argument;             // function argument
+    struct task *next;          // next task
+} task_t;
+
+typedef struct thread_pool {
+    pthread_t* threads;         // threads array
+    task_t* queue_head;           // head of task queue
+    task_t* queue_tail;           // tail of task queue
+    int queue_size;
+    pthread_mutex_t mutex;      // wait for tasks in queue
+    pthread_cond_t condition;   // condition
+} thread_pool_t;
+
+
+/* signatures */
+
+void* worker_loop(void* arg);
+
+
+/* implementation of thread pool with tasks */
+
+thread_pool_t* thread_pool_create(int count) {
+    // allocate memory for struct pool
+    thread_pool_t* pool = (thread_pool_t*)malloc(sizeof(thread_pool_t));
+    if (!pool) {
+        return NULL;
+    }
+
+    // init some things in struct
+    pool->queue_head = NULL;
+    pool->queue_tail = NULL;
+
+    pthread_mutex_init(&pool->mutex, NULL);
+    pthread_cond_init(&pool->condition, NULL);
+
+    // allocate memory for N-threads
+    pool->threads = (pthread_t*)malloc(sizeof(pthread_t) * count);
+    if (!pool->threads) {
+        free(pool);
+        return NULL;
+    }
+
+    // now create threads
+    for (int i = 0; i < count; i++) {
+        if (pthread_create(&pool->threads[i], NULL, worker_loop, pool) != 0) {
+            pthread_cond_broadcast(&pool->condition);
+            for (int j = 0; j < i; j++) {
+                pthread_join(pool->threads[j], NULL);
+            }
+            free(pool->threads);
+            pthread_mutex_destroy(&pool->mutex);
+            pthread_cond_destroy(&pool->condition);
+            free(pool);
+            return NULL;
+        }
+    }
+
+    return pool;
+}
+
+// worker_loop is a loop for threads to wait new tasks
+void* worker_loop(void* arg) {
+    thread_pool_t* pool = (thread_pool_t*)arg;
+
+    while (1) {
+        pthread_mutex_lock(&pool->mutex);
+
+        // wait while no tasks in queue
+        // so basically we wait for new tasks
+        // in infinite loop
+        while (pool->queue_size == 0) {
+            pthread_cond_wait(&pool->condition, &pool->mutex);
+        }
+
+        // extract task.
+        // work with linked list
+        task_t* task = pool->queue_head;
+        if (task) {
+            pool->queue_head = task->next;
+            if (!pool->queue_head) {
+                pool->queue_tail = NULL;
+            }
+            pool->queue_size--;
+        }
+
+        pthread_mutex_unlock(&pool->mutex);
+
+        // now we call function
+        if (task) {
+            task->function(task->argument);
+            free(task);
+        }
+    }
+
+    return NULL;
+}
+
+// thread_pool_add_task creates new task and adds it to queue
+int thread_pool_add_task(thread_pool_t* pool, void (*function)(void*), void* argument) {
+    // error handling
+    if (!pool || !function) {
+        return -1;
+    }
+
+    task_t* new_task = (task_t*)malloc(sizeof(task_t));
+    if (!new_task) {
+        return -1;
+    }
+
+    new_task->function = function;
+    new_task->argument = argument;
+    new_task->next = NULL;
+
+    pthread_mutex_lock(&pool->mutex);
+
+    if (pool->queue_tail) {
+        pool->queue_tail->next = new_task;
+    } else {
+        // empty queue
+        pool->queue_head = new_task;
+    }
+    pool->queue_tail = new_task;
+    pool->queue_size++;
+
+    pthread_cond_signal(&pool->condition);
+    pthread_mutex_unlock(&pool->mutex);
+
+    return 0;
+}
+
 void handle_connection(int client_fd);
+void handle_connection_wrapper(void* arg);
 
 int main() {
     // Create socket
@@ -52,6 +189,9 @@ int main() {
 
     printf("listening on port %d\n", PORT);
 
+    // create thread pool
+    thread_pool_t* pool = thread_pool_create(4);    
+
     // now handle client connections
     while (1) {
         int client_fd = accept(server_fd, NULL, NULL);
@@ -61,13 +201,30 @@ int main() {
             continue;
         }
 
+        // We need to do this because of void* in function arguments
+        int* fd_ptr = malloc(sizeof(int));
+        if (!fd_ptr) {
+            close(client_fd);
+            continue;
+        }
+        *fd_ptr = client_fd;
+
         // handle connection
-        handle_connection(client_fd);
+        thread_pool_add_task(pool, handle_connection_wrapper, fd_ptr);
+
+        //handle_connection(client_fd);
     }
 
     close(server_fd);
 
     return 0;
+}
+
+// handle_connection_wrapper will free(arg)
+void handle_connection_wrapper(void* arg) {
+    int client_fd = *(int*)arg;
+    free(arg);
+    handle_connection(client_fd);
 }
 
 void handle_connection(int client_fd) {
@@ -106,6 +263,7 @@ void handle_connection(int client_fd) {
         int target_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (target_fd == -1) {
             fprintf(stderr, "error creating socket\n");
+            close(client_fd);
             return;
         }
 
