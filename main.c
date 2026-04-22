@@ -21,7 +21,10 @@
 #include <pthread.h>
 
 #define PORT 8081
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 8192
+
+
+/* structures */
 
 
 typedef struct task {
@@ -42,11 +45,16 @@ typedef struct thread_pool {
 
 /* signatures */
 
+
 void* worker_loop(void* arg);
+void handle_connection_wrapper(void* arg);
+void handle_connection(int client_fd);
 
 
 /* implementation of thread pool with tasks */
 
+
+// thread_pool_create creates new thread pool with N threads
 thread_pool_t* thread_pool_create(int count) {
     // allocate memory for struct pool
     thread_pool_t* pool = (thread_pool_t*)malloc(sizeof(thread_pool_t));
@@ -151,13 +159,12 @@ int thread_pool_add_task(thread_pool_t* pool, void (*function)(void*), void* arg
     pool->queue_size++;
 
     pthread_cond_signal(&pool->condition);
+
     pthread_mutex_unlock(&pool->mutex);
 
     return 0;
 }
 
-void handle_connection(int client_fd);
-void handle_connection_wrapper(void* arg);
 
 int main() {
     // Create socket
@@ -225,6 +232,7 @@ void handle_connection_wrapper(void* arg) {
     int client_fd = *(int*)arg;
     free(arg);
     handle_connection(client_fd);
+    close(client_fd);
 }
 
 void handle_connection(int client_fd) {
@@ -232,134 +240,142 @@ void handle_connection(int client_fd) {
 
     char cmdConnect[] = "CONNECT";
 
+    // We need only first line of HTTP-request packet
+    // CONNECT www.host.com:443 HTTP1/1\r\n\r\n
     int bytes_read = read(client_fd, buffer, BUFFER_SIZE - 1);
-    if (bytes_read > 0) {
-        // last symbol
-        buffer[bytes_read] = '\0';
-
-        // if not HTTP CONNECT - close
-        if (strncmp(buffer, cmdConnect, 7) != 0) {
-            close(client_fd);
-            return;
-        }
-
-        // parse "CONNECT www.host.ru:443 HTTP1/1\n\n" line
-        char* first_space = strchr(buffer, ' ');
-        char* colon = strchr(first_space + 1, ':');
-        char* second_space = strchr(first_space + 1, ' ');
-        
-        char host[100] = {0};
-        char port[6] = {0};
-
-        int host_len = (int)(colon - first_space);
-        strncpy(host, first_space + 1, host_len - 1);
-        host[host_len] = '\0';
-
-        int port_len = (int)(second_space - colon);
-        strncpy(port, colon + 1, port_len - 1);
-        port[port_len] = '\0';
-
-        // create connect to host:port
-        int target_fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (target_fd == -1) {
-            fprintf(stderr, "error creating socket\n");
-            close(client_fd);
-            return;
-        }
-
-        int port_i = atoi(port);
-
-        // target address settings
-        struct sockaddr_in address = {
-            .sin_family = AF_INET,
-            .sin_addr.s_addr = INADDR_ANY,
-            .sin_port = htons(port_i)
-        };
-
-        // resolve domain name
-        struct addrinfo hints = {0};
-        struct addrinfo *res = NULL;
-
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
-        hints.ai_protocol = 0;
-
-        if (getaddrinfo(host, port, &hints, &res) != 0) {
-            // send error to client_fd
-            close(target_fd);
-            close(client_fd);
-            return;
-        }
-
-        struct sockaddr_in *addr = (struct sockaddr_in*)res->ai_addr;
-        address.sin_addr = addr->sin_addr;
-        freeaddrinfo(res);
-
-        // finally, do CONNECT
-        if (connect(target_fd, (struct sockaddr*)&address, sizeof(address)) != 0) {
-            printf("connection with the target server failed\n");
-            close(target_fd);
-            close(client_fd);
-            return;
-        }
-
-        // connected
-        char *response = "HTTP/1.1 200 OK\n\n";
-        send(client_fd, response, strlen(response), 0);
-
-        // proxying
-        struct pollfd fds[2];
-        char buf_from_client[BUFFER_SIZE];
-        char buf_from_target[BUFFER_SIZE];
-
-        fds[0].fd = client_fd;
-        fds[0].events = POLLIN;
-        fds[1].fd = target_fd;
-        fds[2].events = POLLIN;
-
-        // timeout in ms
-        int timeout = 5000; 
-
-        while (1) {
-            int ret = poll(fds, 2, timeout);
-            if (ret == 0) {
-                fprintf(stderr, "poll timeout\n");
-                break;
-            } else if (ret < 0) {
-                fprintf(stderr, "error poll\n");
-            }
-
-            // send from client to server
-            if (fds[0].revents & POLLIN) {
-                int n = read(client_fd, buf_from_client, BUFFER_SIZE);
-                if (n <= 0) {
-                    break;
-                }
-                if (send(target_fd, buf_from_client, n, 0) < 0) {
-                    break;
-                }
-            }
-
-            // send from server to client
-            if (fds[1].revents & POLLIN) {
-                int n = read(target_fd, buf_from_target, BUFFER_SIZE);
-                if (n <= 0) {
-                    break;
-                }
-                if (send(client_fd, buf_from_target, n, 0) < 0) {
-                    break;
-                }
-            }
-
-            // safety
-            if ((fds[0].revents & (POLLERR | POLLHUP)) || (fds[1].revents & (POLLERR | POLLHUP))) {
-                break;
-            }
-
-
-        }
-        close(target_fd);
-        close(client_fd);
+    if (bytes_read == 0) {
+        // EOF or closed connection
+        return;
     }
+    
+    if (bytes_read < 0) {
+        fprintf(stderr, "error read socket\n");
+        return;
+    }
+
+    // last symbol
+    // buffer[bytes_read] = '\0';
+
+    // if not HTTP CONNECT - close
+    if (strncmp(buffer, cmdConnect, 7) != 0) {
+        return;
+    }
+
+    // parse "CONNECT www.host.com:443 HTTP1/1\r\n\r\n" line
+    char* first_space = strchr(buffer, ' ');
+    char* colon = strchr(first_space + 1, ':');
+    char* second_space = strchr(first_space + 1, ' ');
+    
+    char host[100] = {0};
+    char port[6] = {0};
+
+    int host_len = (int)(colon - first_space);
+    strncpy(host, first_space + 1, host_len - 1);
+    host[host_len] = '\0';
+
+    int port_len = (int)(second_space - colon);
+    strncpy(port, colon + 1, port_len - 1);
+    port[port_len] = '\0';
+
+    // create connect to host:port
+    int target_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (target_fd == -1) {
+        fprintf(stderr, "error creating socket\n");
+        return;
+    }
+
+    int port_i = atoi(port);
+
+    // target address settings
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = INADDR_ANY,
+        .sin_port = htons(port_i)
+    };
+
+    // resolve domain name
+    struct addrinfo hints = {0};
+    struct addrinfo *res = NULL;
+
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = 0;
+
+    if (getaddrinfo(host, port, &hints, &res) != 0) {
+        // send error to client_fd
+        close(target_fd);
+        return;
+    }
+
+    struct sockaddr_in *addr = (struct sockaddr_in*)res->ai_addr;
+    address.sin_addr = addr->sin_addr;
+    freeaddrinfo(res);
+
+    // finally, do CONNECT
+    if (connect(target_fd, (struct sockaddr*)&address, sizeof(address)) != 0) {
+        printf("connection with the target server failed\n");
+        close(target_fd);
+        return;
+    }
+
+    // connected
+    const char *response = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    send(client_fd, response, strlen(response), 0);
+
+    // proxying
+    struct pollfd fds[2];
+    char buf_from_client[BUFFER_SIZE];
+    char buf_from_target[BUFFER_SIZE];
+
+    fds[0].fd = client_fd;
+    fds[0].events = POLLIN;
+    fds[1].fd = target_fd;
+    fds[1].events = POLLIN;
+
+    // timeout in ms
+    int timeout = 5000; 
+
+    while (1) {
+        int ret = poll(fds, 2, timeout);
+        if (ret == 0) {
+            fprintf(stderr, "poll timeout\n");
+            break;
+        } else if (ret < 0) {
+            fprintf(stderr, "error poll\n");
+            break;
+        }
+
+        // send from client to server
+        if (fds[0].revents & POLLIN) {
+            int n = read(client_fd, buf_from_client, BUFFER_SIZE);
+            if (n <= 0) {
+                fprintf(stderr, "error read from client in proxying\n");
+                break;
+            }
+            if (send(target_fd, buf_from_client, n, 0) < 0) {
+                fprintf(stderr, "error send to target in proxying\n");
+                break;
+            }
+        }
+
+        // send from server to client
+        if (fds[1].revents & POLLIN) {
+            int n = read(target_fd, buf_from_target, BUFFER_SIZE);
+            if (n <= 0) {
+                fprintf(stderr, "error read from target\n");
+                break;
+            }
+            if (send(client_fd, buf_from_target, n, 0) < 0) {
+                fprintf(stderr, "error send to client\n");
+                break;
+            }
+        }
+
+        // safety
+        if ((fds[0].revents & (POLLERR | POLLHUP)) || (fds[1].revents & (POLLERR | POLLHUP))) {
+            break;
+        }
+    }
+    close(target_fd);
 }
 
